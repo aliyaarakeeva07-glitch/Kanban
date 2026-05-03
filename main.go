@@ -10,6 +10,7 @@ import (
 
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
+	"github.com/rs/cors" // Добавили библиотеку CORS
 )
 
 func main() {
@@ -52,25 +53,29 @@ func main() {
 	// --- TASKS (ЗАДАЧИ) ---
 	r.Handle("/tasks", middleware.JWT(http.HandlerFunc(task.GetTasks))).Methods("GET")
 	r.Handle("/tasks", middleware.JWT(http.HandlerFunc(task.CreateTask))).Methods("POST")
-
-	// ВОТ ЭТА СТРОКА БЫЛА НУЖНА ДЛЯ УДАЛЕНИЯ:
 	r.Handle("/tasks/{id}", middleware.JWT(http.HandlerFunc(task.DeleteTask))).Methods("DELETE")
-
-	// Обновление (PUT)
 	r.Handle("/tasks/{id}", middleware.JWT(http.HandlerFunc(task.UpdateTask))).Methods("PUT")
-
-	// Архив и восстановление (PATCH)
 	r.Handle("/tasks/{id}/archive", middleware.JWT(http.HandlerFunc(task.ArchiveTask))).Methods("PATCH")
 	r.Handle("/tasks/{id}/restore", middleware.JWT(http.HandlerFunc(task.RestoreTask))).Methods("PATCH")
 
 	// --- COMMENTS (КОММЕНТАРИИ) ---
-	// Мы используем 'task', так как функции GetComments и DeleteComment
-	// в файле comment.go привязаны к TaskHandler
-	r.Handle("/comments", middleware.JWT(http.HandlerFunc(task.CreateComment))).Methods("POST") // Добавили создание
+	r.Handle("/comments", middleware.JWT(http.HandlerFunc(task.CreateComment))).Methods("POST")
 	r.Handle("/comments", middleware.JWT(http.HandlerFunc(task.GetComments))).Methods("GET")
 	r.Handle("/comments/{id}", middleware.JWT(http.HandlerFunc(task.DeleteComment))).Methods("DELETE")
-	// Используем 'h', потому что функции теперь внутри TaskHandler
+
+	// --- НАСТРОЙКА CORS (Чтобы фронтенд мог подключиться) ---
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"}, // Разрешаем доступ с любого адреса
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"},
+		AllowedHeaders:   []string{"Authorization", "Content-Type"},
+		AllowCredentials: true,
+	})
+
+	// Оборачиваем наш роутер 'r' в cors-обработчик
+	handler := c.Handler(r)
 
 	log.Println("Server running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
+
+	// Запускаем сервер через 'handler' вместо 'r'
+	log.Fatal(http.ListenAndServe(":8080", handler))
 }
