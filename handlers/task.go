@@ -25,26 +25,39 @@ type TaskHandler struct {
 	DB *sql.DB
 }
 
-// Укажи здесь ID колонки "Done" из своей базы данных
+// Вспомогательная функция для отправки JSON-ошибок
+func sendError(w http.ResponseWriter, message string, status int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"error": message})
+}
+
 const doneColumnID = 3
 
-// 🔹 GET /tasks?column_id=1 — Получить активные задачи
+// 🔹 GET /tasks?column_id=1&search=текст
 func (h *TaskHandler) GetTasks(w http.ResponseWriter, r *http.Request) {
 	colIDStr := r.URL.Query().Get("column_id")
+	searchQuery := r.URL.Query().Get("search")
+
 	colID, err := strconv.Atoi(colIDStr)
 	if err != nil {
-		http.Error(w, "Invalid column_id", 400)
+		sendError(w, "Некорректный ID колонки", http.StatusBadRequest)
 		return
 	}
 
-	rows, err := h.DB.Query(`
-		SELECT id, column_id, title, description, priority, position, done_at 
-		FROM tasks 
-		WHERE column_id=$1 AND deleted_at IS NULL AND archived_at IS NULL 
-		ORDER BY position ASC`, colID)
+	// Безопасный запрос: параметры передаются отдельно через $1 и $2
+	query := `
+       SELECT id, column_id, title, description, priority, position, done_at 
+       FROM tasks 
+       WHERE column_id=$1 
+         AND deleted_at IS NULL 
+         AND archived_at IS NULL 
+         AND title ILIKE $2
+       ORDER BY position ASC`
 
+	rows, err := h.DB.Query(query, colID, "%"+searchQuery+"%")
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		sendError(w, "Ошибка базы данных: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -67,7 +80,12 @@ func (h *TaskHandler) GetTasks(w http.ResponseWriter, r *http.Request) {
 func (h *TaskHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 	var t Task
 	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
-		http.Error(w, "Invalid JSON", 400)
+		sendError(w, "Некорректный формат JSON", http.StatusBadRequest)
+		return
+	}
+
+	if t.Title == "" {
+		sendError(w, "Название задачи не может быть пустым", http.StatusBadRequest)
 		return
 	}
 
@@ -75,12 +93,12 @@ func (h *TaskHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 	h.DB.QueryRow("SELECT COALESCE(MAX(position), 0) FROM tasks WHERE column_id=$1", t.ColumnID).Scan(&maxPos)
 
 	err := h.DB.QueryRow(`
-		INSERT INTO tasks (column_id, title, description, priority, position)
-		VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+       INSERT INTO tasks (column_id, title, description, priority, position)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
 		t.ColumnID, t.Title, t.Description, t.Priority, maxPos+1).Scan(&t.ID)
 
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		sendError(w, "Не удалось создать задачу", http.StatusInternalServerError)
 		return
 	}
 
@@ -91,64 +109,74 @@ func (h *TaskHandler) CreateTask(w http.ResponseWriter, r *http.Request) {
 // 🔹 DELETE /tasks/{id} — Мягкое удаление
 func (h *TaskHandler) DeleteTask(w http.ResponseWriter, r *http.Request) {
 	idStr := mux.Vars(r)["id"]
-	_, err := h.DB.Exec("UPDATE tasks SET deleted_at = NOW() WHERE id = $1", idStr)
+	result, err := h.DB.Exec("UPDATE tasks SET deleted_at = NOW() WHERE id = $1", idStr)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		sendError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Проверка, была ли обновлена хоть одна строка
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		sendError(w, "Задача не найдена", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status": "deleted"}`))
 }
 
-// 🔹 PATCH /tasks/{id}/restore — Восстановление из корзины
+// 🔹 PATCH /tasks/{id}/restore — Восстановление
 func (h *TaskHandler) RestoreTask(w http.ResponseWriter, r *http.Request) {
 	idStr := mux.Vars(r)["id"]
 	_, err := h.DB.Exec("UPDATE tasks SET deleted_at = NULL WHERE id = $1", idStr)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		sendError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status": "restored"}`))
 }
 
-// 🔹 PATCH /tasks/{id}/archive — Ручная архивация
+// 🔹 PATCH /tasks/{id}/archive — Архивация
 func (h *TaskHandler) ArchiveTask(w http.ResponseWriter, r *http.Request) {
 	idStr := mux.Vars(r)["id"]
 	_, err := h.DB.Exec("UPDATE tasks SET archived_at = NOW() WHERE id = $1", idStr)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		sendError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status": "archived"}`))
 }
 
-// 🔹 PUT /tasks/{id} — Обновление + Логика Done + Авто-архив
+// 🔹 PUT /tasks/{id} — Обновление
 func (h *TaskHandler) UpdateTask(w http.ResponseWriter, r *http.Request) {
 	idStr := mux.Vars(r)["id"]
 	taskID, _ := strconv.Atoi(idStr)
 
 	var t Task
 	if err := json.NewDecoder(r.Body).Decode(&t); err != nil {
-		http.Error(w, "Invalid JSON", 400)
+		sendError(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	// Добавили ::int к $4 и $7, чтобы убрать ошибку со скриншота 57
 	query := `
-		UPDATE tasks 
-		SET title=$1, 
-			description=$2, 
-			priority=$3, 
-			column_id=$4::int, 
-			position=$5,
-			done_at = CASE 
-				WHEN $4::int = $7::int THEN COALESCE(done_at, NOW()) 
-				ELSE NULL 
-			END,
-			archived_at = CASE 
-				WHEN $4::int = $7::int AND done_at < NOW() - INTERVAL '5 days' THEN NOW() 
-				ELSE archived_at 
-			END
-		WHERE id=$6`
+       UPDATE tasks 
+       SET title=$1, 
+          description=$2, 
+          priority=$3, 
+          column_id=$4::int, 
+          position=$5,
+          done_at = CASE 
+             WHEN $4::int = $7::int THEN COALESCE(done_at, NOW()) 
+             ELSE NULL 
+          END,
+          archived_at = CASE 
+             WHEN $4::int = $7::int AND done_at < NOW() - INTERVAL '5 days' THEN NOW() 
+             ELSE archived_at 
+          END
+       WHERE id=$6`
 
 	_, err := h.DB.Exec(query,
 		t.Title,       // $1
@@ -161,14 +189,10 @@ func (h *TaskHandler) UpdateTask(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if err != nil {
-		http.Error(w, "SQL Error: "+err.Error(), 500)
+		sendError(w, "SQL Error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status": "updated"}`))
 }
-
-// SQL магия:
-// 1. Если попали в Done (ID 3) — ставим done_at. Если ушли — зануляем.
-// 2. Если уже в Done > 5 дней — ставим archived_at.
